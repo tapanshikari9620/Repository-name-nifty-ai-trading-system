@@ -1,7 +1,18 @@
 import sqlite3
+import logging
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+
+# ============================================================
+# LOGGING SETUP
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 DATABASE_NAME = "nifty_market_data.db"
@@ -31,13 +42,25 @@ MARKET_CLOSE_MINUTE = 30
 
 def get_connection():
 
-    connection = sqlite3.connect(
-        DATABASE_NAME
-    )
+    try:
+        connection = sqlite3.connect(
+            DATABASE_NAME
+        )
 
-    connection.row_factory = sqlite3.Row
+        connection.row_factory = sqlite3.Row
 
-    return connection
+        # Validate connection with simple query
+        connection.execute("SELECT 1")
+
+        return connection
+
+    except sqlite3.Error as error:
+        logger.error(
+            f"Database connection failed: {error}"
+        )
+        raise RuntimeError(
+            f"Database connection failed: {error}"
+        )
 
 
 # ============================================================
@@ -92,28 +115,45 @@ def convert_to_ist(timestamp):
 
 def load_snapshots():
 
-    connection = get_connection()
+    connection = None
 
-    cursor = connection.cursor()
+    try:
+        connection = get_connection()
 
-    cursor.execute(
-        """
-        SELECT
-            id,
-            timestamp_utc,
-            spot_price
+        cursor = connection.cursor()
 
-        FROM market_snapshots
+        cursor.execute(
+            """
+            SELECT
+                id,
+                timestamp_utc,
+                spot_price
 
-        ORDER BY timestamp_utc ASC
-        """
-    )
+            FROM market_snapshots
 
-    rows = cursor.fetchall()
+            ORDER BY timestamp_utc ASC
+            """
+        )
 
-    connection.close()
+        rows = cursor.fetchall()
 
-    return rows
+        logger.info(
+            f"Loaded {len(rows)} snapshots from database"
+        )
+
+        return rows
+
+    except sqlite3.Error as error:
+        logger.error(
+            f"Failed to load snapshots from database: {error}"
+        )
+        raise RuntimeError(
+            f"Failed to load snapshots from database: {error}"
+        )
+
+    finally:
+        if connection:
+            connection.close()
 
 
 # ============================================================
@@ -386,13 +426,24 @@ def analyze_price_movements(
         session_snapshots[1:]
     ):
 
-        previous_price = float(
-            previous["spot_price"]
-        )
+        try:
+            previous_price = float(
+                previous["spot_price"]
+            )
 
-        current_price = float(
-            current["spot_price"]
-        )
+            current_price = float(
+                current["spot_price"]
+            )
+
+        except (ValueError, TypeError) as error:
+            logger.warning(
+                f"Skipping price movement: "
+                f"Cannot convert prices to float - "
+                f"previous_id={previous['id']}, "
+                f"current_id={current['id']}, "
+                f"error={error}"
+            )
+            continue
 
         change = (
             current_price
@@ -462,6 +513,29 @@ def analyze_sessions(
         snapshots
     ) in sessions.items():
 
+        # Validate we can parse timestamps for this session
+        first_ist = convert_to_ist(
+            snapshots[0]["timestamp_utc"]
+        )
+
+        if first_ist is None:
+            logger.warning(
+                f"Skipping session {trading_date}: "
+                f"Cannot parse first timestamp"
+            )
+            continue
+
+        last_ist = convert_to_ist(
+            snapshots[-1]["timestamp_utc"]
+        )
+
+        if last_ist is None:
+            logger.warning(
+                f"Skipping session {trading_date}: "
+                f"Cannot parse last timestamp"
+            )
+            continue
+
         interval_analysis = (
             analyze_session_intervals(
                 snapshots
@@ -492,18 +566,10 @@ def analyze_sessions(
                 ],
 
             "first_timestamp_ist":
-                convert_to_ist(
-                    snapshots[0][
-                        "timestamp_utc"
-                    ]
-                ).isoformat(),
+                first_ist.isoformat(),
 
             "last_timestamp_ist":
-                convert_to_ist(
-                    snapshots[-1][
-                        "timestamp_utc"
-                    ]
-                ).isoformat(),
+                last_ist.isoformat(),
 
             "first_price":
                 snapshots[0][
@@ -599,10 +665,23 @@ def determine_quality_status(
 
 def build_report():
 
-    snapshots = load_snapshots()
+    try:
+        snapshots = load_snapshots()
+
+    except RuntimeError as error:
+        logger.error(
+            f"Failed to build report: {error}"
+        )
+        return {
+            "status": "FAIL",
+            "reason": f"Database error: {error}"
+        }
 
     if not snapshots:
 
+        logger.warning(
+            "No market snapshots found in database"
+        )
         return {
 
             "status": "FAIL",
@@ -611,6 +690,10 @@ def build_report():
                 "No market snapshots found."
 
         }
+
+    logger.info(
+        f"Starting validation for {len(snapshots)} snapshots"
+    )
 
     basic_validation = (
         validate_basic_data(
@@ -622,6 +705,11 @@ def build_report():
         group_by_trading_date(
             snapshots
         )
+    )
+
+    logger.info(
+        f"Grouped {len(snapshots)} snapshots into "
+        f"{len(sessions)} trading sessions"
     )
 
     session_reports = (
@@ -643,6 +731,10 @@ def build_report():
             session_reports,
             duplicate_timestamps
         )
+    )
+
+    logger.info(
+        f"Validation complete - Status: {status}"
     )
 
     return {
