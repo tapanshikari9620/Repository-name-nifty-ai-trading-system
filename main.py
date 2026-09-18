@@ -1,45 +1,16 @@
-import os
-import time
-import requests
-from dotenv import load_dotenv
+# This is a sample Python script.
 
-load_dotenv()
+# Press Shift+F10 to execute it or replace it with your code.
+# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
 
-access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
 
-instrument_key = "NSE_INDEX|Nifty 50"
+def print_hi(name):
+    # Use a breakpoint in the code line below to debug your script.
+    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
 
-url = "https://api.upstox.com/v2/market-quote/quotes"
 
-headers = {
-    "Accept": "application/json",
-    "Authorization": f"Bearer {access_token}"
-}
+# Press the green button in the gutter to run the script.
+if __name__ == '__main__':
+    print_hi('PyCharm')
 
-params = {
-    "instrument_key": instrument_key
-}
-
-while True:
-
-    response = requests.get(
-        url,
-        params=params,
-        headers=headers
-    )
-
-    if response.status_code == 200:
-
-        data = response.json()
-
-        nifty = data["data"]["NSE_INDEX:Nifty 50"]
-
-        ltp = nifty["last_price"]
-
-        print("NIFTY LTP:", ltp)
-
-    else:
-        print("API Error:", response.status_code)
-        print(response.text)
-
-    time.sleep(2)
+# See PyCharm help at https://www.jetbrains.com/help/pycharm/

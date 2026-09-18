@@ -27,6 +27,9 @@ backups/
 *.log
 logs/
 
+# Collector process lock
+.option_snapshot_collector.lock
+
 # ML generated data and models
 models/
 model_artifacts/

@@ -1,5 +1,7 @@
 import time
 import sqlite3
+import msvcrt
+import os
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -31,6 +33,10 @@ DATABASE_NAME = "nifty_market_data.db"
 
 COLLECTION_INTERVAL_SECONDS = 60
 
+COLLECTOR_LOCK_FILE = (
+    ".option_snapshot_collector.lock"
+)
+
 MARKET_TIMEZONE = ZoneInfo(
     "Asia/Kolkata"
 )
@@ -49,7 +55,12 @@ MARKET_CLOSE_MINUTE = 30
 def get_connection():
 
     connection = sqlite3.connect(
-        DATABASE_NAME
+        DATABASE_NAME,
+        timeout=30
+    )
+
+    connection.execute(
+        "PRAGMA busy_timeout = 30000"
     )
 
     connection.execute(
@@ -57,6 +68,76 @@ def get_connection():
     )
 
     return connection
+
+
+def acquire_collector_lock():
+
+    lock_path = os.path.join(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        ),
+        COLLECTOR_LOCK_FILE
+    )
+
+    lock_handle = open(
+        lock_path,
+        "a+b"
+    )
+
+    lock_handle.seek(
+        0,
+        os.SEEK_END
+    )
+
+    if lock_handle.tell() == 0:
+
+        lock_handle.write(b"1")
+        lock_handle.flush()
+
+    lock_handle.seek(0)
+
+    try:
+
+        msvcrt.locking(
+            lock_handle.fileno(),
+            msvcrt.LK_NBLCK,
+            1
+        )
+
+    except OSError as error:
+
+        lock_handle.close()
+
+        raise RuntimeError(
+            "Another option snapshot collector "
+            "instance is already running."
+        ) from error
+
+    return lock_handle
+
+
+def configure_database():
+
+    connection = sqlite3.connect(
+        DATABASE_NAME,
+        timeout=30
+    )
+
+    try:
+
+        connection.execute(
+            "PRAGMA busy_timeout = 30000"
+        )
+
+        connection.execute(
+            "PRAGMA journal_mode = WAL"
+        )
+
+        connection.commit()
+
+    finally:
+
+        connection.close()
 
 
 # ============================================================
@@ -928,6 +1009,23 @@ def wait_until_market_open():
 
 def run_collector():
 
+    try:
+
+        collector_lock = (
+            acquire_collector_lock()
+        )
+
+        configure_database()
+
+    except RuntimeError as error:
+
+        print()
+        print(
+            f"[COLLECTOR NOT STARTED] {error}"
+        )
+
+        return
+
     print()
     print("=" * 70)
 
@@ -1063,6 +1161,8 @@ def run_collector():
             time.sleep(
                 10
             )
+
+    collector_lock.close()
 
 
 # ============================================================

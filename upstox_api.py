@@ -8,10 +8,6 @@ from config import (
 )
 
 
-# ============================================================
-# HEADERS
-# ============================================================
-
 def get_headers():
 
     return {
@@ -19,10 +15,6 @@ def get_headers():
         "Authorization": f"Bearer {ACCESS_TOKEN}"
     }
 
-
-# ============================================================
-# GET OPTION CONTRACTS
-# ============================================================
 
 def get_option_contracts():
 
@@ -75,10 +67,6 @@ def get_option_contracts():
     return contracts
 
 
-# ============================================================
-# FIND NEAREST EXPIRY
-# ============================================================
-
 def get_nearest_expiry():
 
     contracts = get_option_contracts()
@@ -105,10 +93,6 @@ def get_nearest_expiry():
 
     return nearest_expiry
 
-
-# ============================================================
-# GET OPTION CHAIN
-# ============================================================
 
 def get_option_chain():
 

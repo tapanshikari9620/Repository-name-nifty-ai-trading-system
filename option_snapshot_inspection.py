@@ -30,10 +30,19 @@ MAX_REASONABLE_VOLUME = 10000000000.0
 def get_connection():
 
     connection = sqlite3.connect(
-        DATABASE_NAME
+        DATABASE_NAME,
+        timeout=30
     )
 
     connection.row_factory = sqlite3.Row
+
+    connection.execute(
+        "PRAGMA busy_timeout = 30000"
+    )
+
+    connection.execute(
+        "PRAGMA query_only = ON"
+    )
 
     connection.execute(
         "PRAGMA foreign_keys = ON"
