@@ -1,7 +1,13 @@
 import sqlite3
+import os
+from pathlib import Path
+
 from datetime import datetime, timezone
 
-DATABASE_NAME = "nifty_market_data.db"
+DATABASE_NAME = os.environ.get(
+    "NIFTY_MARKET_DATABASE",
+    str(Path(__file__).resolve().parent / "nifty_market_data.db"),
+)
 
 HORIZONS = {
     "5m": "outcome_5m_direction",
@@ -23,7 +29,7 @@ ALLOWED_LABELS = {"BULLISH", "BEARISH", "FLAT"}
 
 def get_connection():
     conn = sqlite3.connect(
-        f"file:{DATABASE_NAME}?mode=ro",
+        Path(DATABASE_NAME).resolve().as_uri() + "?mode=ro",
         uri=True
     )
     conn.row_factory = sqlite3.Row
@@ -46,6 +52,19 @@ def parse_timestamp(value):
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return None
+
+
+def select_candidate_features(market_columns):
+    excluded = {
+        "id",
+        "market_snapshot_id",
+        "timestamp_utc",
+        "created_at_utc",
+    }
+    return [
+        column for column in market_columns
+        if column not in excluded
+    ]
 
 
 def main():
@@ -98,16 +117,9 @@ def main():
         print("TEST 2 - FEATURE COLUMN SAFETY")
         print("-" * 70)
 
-        excluded = {
-            "market_snapshot_id",
-            "timestamp_utc",
-            "created_at_utc",
-        }
-
-        candidate_features = [
-            col for col in market_columns
-            if col not in excluded
-        ]
+        candidate_features = select_candidate_features(
+            market_columns
+        )
 
         unsafe_features = []
         for col in candidate_features:

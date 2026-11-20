@@ -1,14 +1,19 @@
 import sqlite3
 import math
+import os
+from pathlib import Path
+
+import historical_feature_builder as feature_builder
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-DATABASE_NAME = "nifty_market_data.db"
-
-EXPECTED_OPTIONS_PER_SNAPSHOT = 210
+DATABASE_NAME = os.environ.get(
+    "NIFTY_MARKET_DATABASE",
+    str(Path(__file__).resolve().parent / "nifty_market_data.db"),
+)
 
 FLOAT_TOLERANCE = 1e-6
 
@@ -19,11 +24,11 @@ FLOAT_TOLERANCE = 1e-6
 
 def get_connection():
 
-    connection = sqlite3.connect(
-        DATABASE_NAME
-    )
+    database_uri = Path(DATABASE_NAME).resolve().as_uri() + "?mode=ro"
+    connection = sqlite3.connect(database_uri, uri=True)
 
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
 
     return connection
 
@@ -155,17 +160,31 @@ def calculate_raw_metrics(
         market_snapshot_id
     )
 
-    if len(option_rows) != EXPECTED_OPTIONS_PER_SNAPSHOT:
+    connection = get_connection()
+    market_row = connection.execute(
+        """
+        SELECT id, timestamp_utc, spot_price
+        FROM market_snapshots
+        WHERE id = ?
+        """,
+        (market_snapshot_id,),
+    ).fetchone()
+    connection.close()
 
+    if market_row is None:
         return {
             "valid": False,
-            "reason":
-                (
-                    "Expected "
-                    f"{EXPECTED_OPTIONS_PER_SNAPSHOT} "
-                    "option records, received "
-                    f"{len(option_rows)}."
-                )
+            "reason": "Market snapshot does not exist.",
+        }
+
+    structural_errors = feature_builder.validate_snapshot_records(
+        market_row,
+        option_rows,
+    )
+    if structural_errors:
+        return {
+            "valid": False,
+            "reason": "; ".join(structural_errors),
         }
 
     ce_rows = [
@@ -179,24 +198,6 @@ def calculate_raw_metrics(
         for row in option_rows
         if row["option_type"] == "PE"
     ]
-
-    if len(ce_rows) != 105:
-
-        return {
-            "valid": False,
-            "reason":
-                f"Expected 105 CE records, "
-                f"received {len(ce_rows)}."
-        }
-
-    if len(pe_rows) != 105:
-
-        return {
-            "valid": False,
-            "reason":
-                f"Expected 105 PE records, "
-                f"received {len(pe_rows)}."
-        }
 
     # ========================================================
     # STRIKES
@@ -253,12 +254,7 @@ def calculate_raw_metrics(
     # PCR
     # ========================================================
 
-    pcr = (
-        total_pe_oi
-        / total_ce_oi
-        if total_ce_oi > 0
-        else 0.0
-    )
+    pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else None
 
     # ========================================================
     # OI CHANGE
@@ -617,51 +613,54 @@ def validate_all_features():
 def validate_option_feature_counts():
 
     connection = get_connection()
-
     cursor = connection.cursor()
-
     cursor.execute(
-        """
-        SELECT
-            market_snapshot_id,
-            COUNT(*) AS record_count
-
-        FROM option_features
-
-        GROUP BY
-            market_snapshot_id
-
-        ORDER BY
-            market_snapshot_id
-        """
+        "SELECT DISTINCT market_snapshot_id FROM option_features "
+        "ORDER BY market_snapshot_id"
     )
-
     rows = cursor.fetchall()
-
-    connection.close()
-
     invalid_snapshots = []
 
     for row in rows:
-
-        if (
-            row["record_count"]
-            != EXPECTED_OPTIONS_PER_SNAPSHOT
-        ):
-
+        snapshot_id = row["market_snapshot_id"]
+        raw_rows = connection.execute(
+            """
+            SELECT expiry, strike, option_type
+            FROM option_snapshots
+            WHERE market_snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        feature_rows = connection.execute(
+            """
+            SELECT expiry, strike, option_type
+            FROM option_features
+            WHERE market_snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        raw_contracts = {
+            (item["expiry"], item["strike"], item["option_type"])
+            for item in raw_rows
+        }
+        feature_contracts = {
+            (item["expiry"], item["strike"], item["option_type"])
+            for item in feature_rows
+        }
+        missing = raw_contracts - feature_contracts
+        unexpected = feature_contracts - raw_contracts
+        if missing or unexpected or len(raw_rows) != len(feature_rows):
             invalid_snapshots.append(
                 {
-                    "market_snapshot_id":
-                        row[
-                            "market_snapshot_id"
-                        ],
-
-                    "record_count":
-                        row[
-                            "record_count"
-                        ]
+                    "market_snapshot_id": snapshot_id,
+                    "record_count": len(feature_rows),
+                    "raw_record_count": len(raw_rows),
+                    "missing_contracts": len(missing),
+                    "unexpected_contracts": len(unexpected),
                 }
             )
+
+    connection.close()
 
     return {
 
@@ -806,12 +805,11 @@ if __name__ == "__main__":
         ):
 
             print(
-                f"Snapshot "
-                f"{invalid['market_snapshot_id']} "
-                f"has "
-                f"{invalid['record_count']} "
-                f"records; expected "
-                f"{EXPECTED_OPTIONS_PER_SNAPSHOT}."
+                f"Snapshot {invalid['market_snapshot_id']} has "
+                f"{invalid['record_count']} feature rows versus "
+                f"{invalid['raw_record_count']} raw contracts "
+                f"(missing={invalid['missing_contracts']}, "
+                f"unexpected={invalid['unexpected_contracts']})."
             )
 
     # ========================================================
@@ -848,8 +846,7 @@ if __name__ == "__main__":
         )
 
         print(
-            "All option feature snapshots "
-            "contain exactly 210 records."
+            "Option feature rows match their raw contracts."
         )
 
     else:

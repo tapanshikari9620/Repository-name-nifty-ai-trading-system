@@ -1,22 +1,52 @@
 import sqlite3
 import math
+import os
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-DATABASE_NAME = "nifty_market_data.db"
+DATABASE_NAME = os.environ.get(
+    "NIFTY_MARKET_DATABASE",
+    str(Path(__file__).resolve().parent / "nifty_market_data.db"),
+)
 
-EXPECTED_OPTIONS_PER_SNAPSHOT = 210
+REQUIRED_OPTION_NUMERIC_FIELDS = (
+    "oi",
+    "oi_change",
+    "volume",
+)
 
-EXPECTED_CE_RECORDS = 105
-
-EXPECTED_PE_RECORDS = 105
+OPTION_NUMERIC_FIELDS = (
+    "ltp",
+    "close_price",
+    "volume",
+    "oi",
+    "prev_oi",
+    "oi_change",
+    "bid_price",
+    "bid_qty",
+    "ask_price",
+    "ask_qty",
+    "iv",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "pop",
+)
 
 MAX_CONTINUITY_GAP_SECONDS = 90.0
+DEFAULT_FEATURE_BATCH_SIZE = int(
+    os.environ.get("NIFTY_FEATURE_BATCH_SIZE", "100")
+)
+PRODUCTION_DATABASE_PATH = (
+    Path(__file__).resolve().parent / "nifty_market_data.db"
+).resolve()
 
 
 # ============================================================
@@ -25,8 +55,17 @@ MAX_CONTINUITY_GAP_SECONDS = 90.0
 
 def get_connection():
 
-    connection = sqlite3.connect(
+    database_path = Path(
         DATABASE_NAME
+    ).expanduser().resolve()
+
+    if not database_path.is_file():
+        raise FileNotFoundError(
+            f"Database not found: {database_path}"
+        )
+
+    connection = sqlite3.connect(
+        database_path
     )
 
     connection.row_factory = sqlite3.Row
@@ -37,6 +76,42 @@ def get_connection():
 
     return connection
 
+
+def assert_safe_write_target(connection):
+    database_path = Path(DATABASE_NAME).expanduser().resolve()
+    production_path = PRODUCTION_DATABASE_PATH
+
+    if database_path == production_path:
+        raise RuntimeError(
+            "Historical feature writes are disabled for the production "
+            f"database: {database_path}"
+        )
+
+    database_rows = connection.execute(
+        "PRAGMA database_list"
+    ).fetchall()
+    connected_paths = {
+        Path(row[2]).expanduser().resolve()
+        for row in database_rows
+        if row[1] == "main" and row[2]
+    }
+
+    if connected_paths != {database_path}:
+        raise RuntimeError(
+            "Database connection does not match the configured isolated "
+            f"database path: configured={database_path}, "
+            f"connected={sorted(map(str, connected_paths))}"
+        )
+
+
+def get_write_connection():
+    connection = get_connection()
+    try:
+        assert_safe_write_target(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
 
 # ============================================================
 # TIMESTAMP PARSER
@@ -96,6 +171,127 @@ def safe_number(value):
         return 0.0
 
 
+def finite_number(value):
+    if value is None:
+        return None
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    return number if math.isfinite(number) else None
+
+
+def validate_snapshot_records(market_row, option_rows):
+    errors = []
+    market_snapshot_id = market_row["id"]
+    market_timestamp = parse_timestamp(market_row["timestamp_utc"])
+    spot_price = finite_number(market_row["spot_price"])
+
+    if market_timestamp is None:
+        errors.append("Market snapshot timestamp is missing or invalid.")
+
+    if spot_price is None or spot_price <= 0:
+        errors.append("Market spot price must be finite and greater than zero.")
+
+    if not option_rows:
+        errors.append("Snapshot has no option records.")
+        return errors
+
+    expiries = set()
+    ce_strikes = set()
+    pe_strikes = set()
+    contracts = set()
+    instrument_keys = set()
+
+    for row in option_rows:
+        if row["market_snapshot_id"] != market_snapshot_id:
+            errors.append(
+                f"Option record {row['id']} links to a different market snapshot."
+            )
+
+        expiry_value = row["expiry"]
+        expiry = str(expiry_value).strip() if expiry_value is not None else ""
+        if not expiry:
+            errors.append(f"Option record {row['id']} has no valid expiry.")
+        else:
+            expiries.add(expiry)
+
+        row_timestamp = parse_timestamp(row["timestamp_utc"])
+        if row_timestamp is None:
+            errors.append(f"Option record {row['id']} has an invalid timestamp.")
+        elif market_timestamp is None or row_timestamp != market_timestamp:
+            errors.append(
+                f"Option record {row['id']} timestamp does not match "
+                "its market snapshot."
+            )
+
+        strike = finite_number(row["strike"])
+        if strike is None or strike <= 0:
+            errors.append(f"Option record {row['id']} has an invalid strike.")
+
+        option_type = row["option_type"]
+        if option_type not in ("CE", "PE"):
+            errors.append(
+                f"Option record {row['id']} has invalid type {option_type!r}."
+            )
+
+        for field in OPTION_NUMERIC_FIELDS:
+            value = row[field]
+            numeric_value = finite_number(value)
+            if field in REQUIRED_OPTION_NUMERIC_FIELDS and value is None:
+                errors.append(
+                    f"Option record {row['id']} is missing required numeric "
+                    f"field {field!r}."
+                )
+            elif value is not None and numeric_value is None:
+                errors.append(
+                    f"Option record {row['id']} field {field!r} "
+                    "is not a finite number."
+                )
+            elif (
+                numeric_value is not None
+                and field in ("oi", "volume")
+                and numeric_value < 0
+            ):
+                errors.append(
+                    f"Option record {row['id']} field {field!r} cannot be negative."
+                )
+
+        if strike is not None and strike > 0 and option_type in ("CE", "PE"):
+            contract = (expiry, strike, option_type)
+            if contract in contracts:
+                errors.append(
+                    "Duplicate option contract: "
+                    f"expiry={expiry!r}, strike={strike:g}, type={option_type}."
+                )
+            contracts.add(contract)
+            if option_type == "CE":
+                ce_strikes.add(strike)
+            else:
+                pe_strikes.add(strike)
+
+        instrument_key = row["instrument_key"]
+        if instrument_key:
+            if instrument_key in instrument_keys:
+                errors.append(
+                    f"Duplicate instrument key {instrument_key!r} in snapshot."
+                )
+            instrument_keys.add(instrument_key)
+
+    if len(expiries) != 1:
+        errors.append(
+            "Snapshot must contain exactly one non-empty expiry; "
+            f"found {len(expiries)}."
+        )
+
+    if not ce_strikes or not pe_strikes or ce_strikes != pe_strikes:
+        errors.append("CE and PE contracts do not have matching strike coverage.")
+
+    return errors
+
+
 # ============================================================
 # FIND ATM STRIKE
 # ============================================================
@@ -125,14 +321,13 @@ def find_atm(
 # LOAD MARKET + OPTION SNAPSHOTS
 # ============================================================
 
-def load_snapshot_data():
+def load_snapshot_data(limit=None, offset=0):
 
     connection = get_connection()
 
     cursor = connection.cursor()
 
-    cursor.execute(
-        """
+    market_query = """
         SELECT
             id,
             timestamp_utc,
@@ -143,35 +338,49 @@ def load_snapshot_data():
         ORDER BY
             timestamp_utc ASC,
             id ASC
-        """
-    )
+    """
+    market_parameters = ()
+    if limit is not None:
+        if not isinstance(limit, int) or limit <= 0:
+            connection.close()
+            raise ValueError("Snapshot batch limit must be a positive integer.")
+        if not isinstance(offset, int) or offset < 0:
+            connection.close()
+            raise ValueError("Snapshot batch offset cannot be negative.")
+        market_query += " LIMIT ? OFFSET ?"
+        market_parameters = (limit, offset)
+
+    cursor.execute(market_query, market_parameters)
 
     market_rows = cursor.fetchall()
+
+    if not market_rows:
+        connection.close()
+        return []
+
+    snapshot_ids = [row["id"] for row in market_rows]
+    placeholders = ",".join("?" for _ in snapshot_ids)
+    cursor.execute(
+        f"""
+        SELECT *
+        FROM option_snapshots
+        WHERE market_snapshot_id IN ({placeholders})
+        ORDER BY market_snapshot_id, strike ASC, option_type ASC
+        """,
+        snapshot_ids,
+    )
+    options_by_snapshot = {}
+    for row in cursor.fetchall():
+        options_by_snapshot.setdefault(
+            row["market_snapshot_id"], []
+        ).append(row)
 
     snapshots = []
 
     for market_row in market_rows:
 
         snapshot_id = market_row["id"]
-
-        cursor.execute(
-            """
-            SELECT *
-
-            FROM option_snapshots
-
-            WHERE market_snapshot_id = ?
-
-            ORDER BY
-                strike ASC,
-                option_type ASC
-            """,
-            (
-                snapshot_id,
-            )
-        )
-
-        option_rows = cursor.fetchall()
+        option_rows = options_by_snapshot.get(snapshot_id, [])
 
         # ----------------------------------------------------
         # Separate CE / PE
@@ -199,89 +408,16 @@ def load_snapshot_data():
             ]
         )
 
-        # ----------------------------------------------------
-        # Expiry validation
-        # ----------------------------------------------------
+        validation_errors = validate_snapshot_records(
+            market_row,
+            option_rows,
+        )
 
         expiries = {
-            row["expiry"]
+            str(row["expiry"]).strip()
             for row in option_rows
-            if row["expiry"]
+            if row["expiry"] is not None and str(row["expiry"]).strip()
         }
-
-        # ----------------------------------------------------
-        # Contract uniqueness
-        # ----------------------------------------------------
-
-        contracts = set()
-
-        duplicate_contract = False
-
-        for row in option_rows:
-
-            contract_key = (
-                row["expiry"],
-                safe_number(
-                    row["strike"]
-                ),
-                row["option_type"]
-            )
-
-            if contract_key in contracts:
-
-                duplicate_contract = True
-
-                break
-
-            contracts.add(
-                contract_key
-            )
-
-        # ----------------------------------------------------
-        # CE / PE strike pairing
-        # ----------------------------------------------------
-
-        ce_strikes = {
-            safe_number(
-                row["strike"]
-            )
-            for row in ce_rows
-        }
-
-        pe_strikes = {
-            safe_number(
-                row["strike"]
-            )
-            for row in pe_rows
-        }
-
-        paired_strikes = (
-            ce_strikes == pe_strikes
-        )
-
-        # ----------------------------------------------------
-        # Completeness
-        # ----------------------------------------------------
-
-        complete = (
-
-            len(option_rows)
-            == EXPECTED_OPTIONS_PER_SNAPSHOT
-
-            and len(ce_rows)
-            == EXPECTED_CE_RECORDS
-
-            and len(pe_rows)
-            == EXPECTED_PE_RECORDS
-
-            and len(expiries) == 1
-
-            and timestamp is not None
-
-            and not duplicate_contract
-
-            and paired_strikes
-        )
 
         snapshots.append(
             {
@@ -297,7 +433,7 @@ def load_snapshot_data():
                     timestamp,
 
                 "spot_price":
-                    safe_number(
+                    finite_number(
                         market_row[
                             "spot_price"
                         ]
@@ -318,8 +454,11 @@ def load_snapshot_data():
                         None
                     ),
 
+                "validation_errors":
+                    validation_errors,
+
                 "complete":
-                    complete
+                    not validation_errors
             }
         )
 
@@ -332,14 +471,13 @@ def load_snapshot_data():
 # LOAD COLLECTION HEALTH
 # ============================================================
 
-def load_collection_health():
+def load_collection_health(snapshot_ids=None):
 
     connection = get_connection()
 
     cursor = connection.cursor()
 
-    cursor.execute(
-        """
+    query = """
         SELECT
             market_snapshot_id,
             status,
@@ -348,8 +486,17 @@ def load_collection_health():
         FROM collection_health
 
         WHERE market_snapshot_id IS NOT NULL
-        """
-    )
+    """
+    parameters = ()
+    if snapshot_ids is not None:
+        if not snapshot_ids:
+            connection.close()
+            return {}
+        placeholders = ",".join("?" for _ in snapshot_ids)
+        query += f" AND market_snapshot_id IN ({placeholders})"
+        parameters = tuple(snapshot_ids)
+
+    cursor.execute(query, parameters)
 
     rows = cursor.fetchall()
 
@@ -424,10 +571,9 @@ def is_snapshot_health_valid(
 # ============================================================
 
 def calculate_continuity(
-    snapshots
+    snapshots,
+    previous_valid_snapshot=None,
 ):
-
-    previous_valid_snapshot = None
 
     for snapshot in snapshots:
 
@@ -506,6 +652,8 @@ def calculate_continuity(
             snapshot
         )
 
+    return previous_valid_snapshot
+
 
 # ============================================================
 # CALCULATE MARKET FEATURES
@@ -583,7 +731,7 @@ def calculate_market_features(
 
     else:
 
-        pcr = 0.0
+        pcr = None
 
     # ========================================================
     # TOTAL CE OI CHANGE
@@ -801,10 +949,15 @@ def calculate_market_features(
 # ============================================================
 
 def store_market_feature_row(
-    features
+    features,
+    connection=None,
 ):
 
-    connection = get_connection()
+    owns_connection = connection is None
+    if owns_connection:
+        connection = get_write_connection()
+    else:
+        assert_safe_write_target(connection)
 
     cursor = connection.cursor()
 
@@ -816,7 +969,7 @@ def store_market_feature_row(
 
     cursor.execute(
         """
-        INSERT OR REPLACE INTO market_features (
+        INSERT OR IGNORE INTO market_features (
 
             market_snapshot_id,
             timestamp_utc,
@@ -930,9 +1083,11 @@ def store_market_feature_row(
         )
     )
 
-    connection.commit()
-
-    connection.close()
+    inserted = cursor.rowcount
+    if owns_connection:
+        connection.commit()
+        connection.close()
+    return inserted
 
 
 # ============================================================
@@ -940,10 +1095,15 @@ def store_market_feature_row(
 # ============================================================
 
 def store_option_feature_rows(
-    snapshot
+    snapshot,
+    connection=None,
 ):
 
-    connection = get_connection()
+    owns_connection = connection is None
+    if owns_connection:
+        connection = get_write_connection()
+    else:
+        assert_safe_write_target(connection)
 
     cursor = connection.cursor()
 
@@ -963,7 +1123,7 @@ def store_option_feature_rows(
 
             cursor.execute(
                 """
-                INSERT OR REPLACE INTO option_features (
+                INSERT OR IGNORE INTO option_features (
 
                     market_snapshot_id,
                     timestamp_utc,
@@ -1091,19 +1251,22 @@ def store_option_feature_rows(
 
             inserted += 1
 
-        connection.commit()
+        if owns_connection:
+            connection.commit()
 
         return inserted
 
     except Exception:
 
-        connection.rollback()
+        if owns_connection:
+            connection.rollback()
 
         raise
 
     finally:
 
-        connection.close()
+        if owns_connection:
+            connection.close()
 
 
 # ============================================================
@@ -1148,172 +1311,164 @@ def get_feature_count(
 # BUILD HISTORICAL FEATURES
 # ============================================================
 
-def build_historical_features():
+def build_historical_features(
+    batch_size=DEFAULT_FEATURE_BATCH_SIZE,
+    progress_callback=None,
+):
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer.")
 
-    snapshots = load_snapshot_data()
+    read_connection = get_connection()
+    total_snapshots = read_connection.execute(
+        "SELECT COUNT(*) FROM market_snapshots"
+    ).fetchone()[0]
+    read_connection.close()
+    if not total_snapshots:
+        raise RuntimeError("No market snapshots found.")
 
-    health = load_collection_health()
+    market_features_before = get_feature_count("market_features")
+    option_features_before = get_feature_count("option_features")
+    counts = {
+        "processed_snapshots": 0,
+        "complete_snapshots": 0,
+        "skipped_incomplete": 0,
+        "skipped_unhealthy": 0,
+        "rejected_snapshots": 0,
+        "failed_snapshots": 0,
+        "continuous_snapshots": 0,
+        "non_continuous_snapshots": 0,
+        "batches_processed": 0,
+    }
+    rejection_reasons = {}
+    failure_reasons = {}
+    previous_valid_snapshot = None
 
-    if not snapshots:
+    def add_reason(reason_counts, reason):
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
-        raise RuntimeError(
-            "No market snapshots found."
+    for offset in range(0, total_snapshots, batch_size):
+        snapshots = load_snapshot_data(
+            limit=batch_size,
+            offset=offset,
         )
+        if not snapshots:
+            break
 
-    calculate_continuity(
-        snapshots
-    )
-
-    total_snapshots = len(
-        snapshots
-    )
-
-    complete_snapshots = 0
-
-    skipped_incomplete = 0
-
-    skipped_unhealthy = 0
-
-    continuous_snapshots = 0
-
-    non_continuous_snapshots = 0
-
-    market_features_before = (
-        get_feature_count(
-            "market_features"
+        snapshot_ids = [
+            snapshot["market_snapshot_id"]
+            for snapshot in snapshots
+        ]
+        health = load_collection_health(snapshot_ids)
+        previous_valid_snapshot = calculate_continuity(
+            snapshots,
+            previous_valid_snapshot,
         )
-    )
+        batch_processed = 0
+        batch_rejected = 0
+        batch_failed = 0
 
-    option_features_before = (
-        get_feature_count(
-            "option_features"
-        )
-    )
+        write_connection = get_connection()
+        try:
+            assert_safe_write_target(write_connection)
+            for snapshot in snapshots:
+                snapshot_id = snapshot["market_snapshot_id"]
 
-    for snapshot in snapshots:
+                if not snapshot["complete"]:
+                    counts["skipped_incomplete"] += 1
+                    counts["rejected_snapshots"] += 1
+                    batch_rejected += 1
+                    for reason in snapshot["validation_errors"]:
+                        add_reason(rejection_reasons, reason)
+                    continue
 
-        snapshot_id = (
-            snapshot[
-                "market_snapshot_id"
-            ]
-        )
+                if not is_snapshot_health_valid(snapshot_id, health):
+                    counts["skipped_unhealthy"] += 1
+                    add_reason(
+                        rejection_reasons,
+                        "Collection health rejected snapshot.",
+                    )
+                    continue
 
-        # ====================================================
-        # COMPLETENESS
-        # ====================================================
+                if snapshot["continuous"]:
+                    counts["continuous_snapshots"] += 1
+                else:
+                    counts["non_continuous_snapshots"] += 1
 
-        if not snapshot[
-            "complete"
-        ]:
+                counts["complete_snapshots"] += 1
+                try:
+                    market_features = calculate_market_features(snapshot)
+                except Exception as error:
+                    counts["failed_snapshots"] += 1
+                    batch_failed += 1
+                    add_reason(
+                        failure_reasons,
+                        f"{type(error).__name__}: {error}",
+                    )
+                    continue
 
-            skipped_incomplete += 1
+                store_market_feature_row(
+                    market_features,
+                    connection=write_connection,
+                )
+                store_option_feature_rows(
+                    snapshot,
+                    connection=write_connection,
+                )
+                counts["processed_snapshots"] += 1
+                batch_processed += 1
 
-            continue
+            write_connection.commit()
+        except BaseException:
+            write_connection.rollback()
+            raise
+        finally:
+            write_connection.close()
 
-        # ====================================================
-        # COLLECTION HEALTH
-        # ====================================================
-
-        if not is_snapshot_health_valid(
-            snapshot_id,
-            health
-        ):
-
-            skipped_unhealthy += 1
-
-            continue
-
-        complete_snapshots += 1
-
-        # ====================================================
-        # CONTINUITY
-        # ====================================================
-
-        if snapshot[
-            "continuous"
-        ]:
-
-            continuous_snapshots += 1
-
+        counts["batches_processed"] += 1
+        processed_through = min(offset + len(snapshots), total_snapshots)
+        progress = {
+            "batch": counts["batches_processed"],
+            "batch_size": batch_size,
+            "processed_through": processed_through,
+            "total_snapshots": total_snapshots,
+            "processed_snapshots": counts["processed_snapshots"],
+            "rejected_snapshots": counts["rejected_snapshots"],
+            "failed_snapshots": counts["failed_snapshots"],
+        }
+        if progress_callback is not None:
+            progress_callback(progress)
         else:
-
-            non_continuous_snapshots += 1
-
-        # ====================================================
-        # CALCULATE MARKET FEATURES
-        # ====================================================
-
-        market_features = (
-            calculate_market_features(
-                snapshot
+            print(
+                f"Batch {progress['batch']}: "
+                f"{processed_through}/{total_snapshots} scanned; "
+                f"processed={batch_processed}, "
+                f"rejected={batch_rejected}, failed={batch_failed}"
             )
-        )
 
-        # ====================================================
-        # STORE MARKET FEATURES
-        # ====================================================
+        if previous_valid_snapshot is not None:
+            previous_valid_snapshot = {
+                "market_snapshot_id":
+                    previous_valid_snapshot["market_snapshot_id"],
+                "timestamp":
+                    previous_valid_snapshot["timestamp"],
+                "complete": True,
+            }
+        del snapshots
 
-        store_market_feature_row(
-            market_features
-        )
-
-        # ====================================================
-        # STORE OPTION FEATURES
-        # ====================================================
-
-        store_option_feature_rows(
-            snapshot
-        )
-
-    market_features_after = (
-        get_feature_count(
-            "market_features"
-        )
-    )
-
-    option_features_after = (
-        get_feature_count(
-            "option_features"
-        )
-    )
-
+    market_features_after = get_feature_count("market_features")
+    option_features_after = get_feature_count("option_features")
     return {
-
-        "total_snapshots":
-            total_snapshots,
-
-        "complete_snapshots":
-            complete_snapshots,
-
-        "skipped_incomplete":
-            skipped_incomplete,
-
-        "skipped_unhealthy":
-            skipped_unhealthy,
-
-        "continuous_snapshots":
-            continuous_snapshots,
-
-        "non_continuous_snapshots":
-            non_continuous_snapshots,
-
+        "total_snapshots": total_snapshots,
+        **counts,
+        "skipped_validation_reasons": rejection_reasons,
+        "rejection_reasons": rejection_reasons,
+        "failure_reasons": failure_reasons,
         "market_features_created":
-            (
-                market_features_after
-                - market_features_before
-            ),
-
+            market_features_after - market_features_before,
         "option_features_created":
-            (
-                option_features_after
-                - option_features_before
-            ),
-
-        "market_feature_total":
-            market_features_after,
-
-        "option_feature_total":
-            option_features_after
+            option_features_after - option_features_before,
+        "market_feature_total": market_features_after,
+        "option_feature_total": option_features_after,
     }
 
 
@@ -1382,103 +1537,158 @@ def verify_feature_data():
 # ============================================================
 
 def verify_feature_integrity():
-
     connection = get_connection()
-
+    invalid_feature_snapshots = set()
+    missing_option_features = 0
     cursor = connection.cursor()
-
-    # --------------------------------------------------------
-    # Market feature duplicates
-    # --------------------------------------------------------
-
-    cursor.execute(
-        """
-        SELECT
-            market_snapshot_id,
-            COUNT(*)
-
-        FROM market_features
-
-        GROUP BY
-            market_snapshot_id
-
-        HAVING COUNT(*) > 1
-        """
-    )
-
-    market_duplicates = (
-        cursor.fetchall()
-    )
-
-    # --------------------------------------------------------
-    # Option feature duplicates
-    # --------------------------------------------------------
-
-    cursor.execute(
-        """
-        SELECT
-            market_snapshot_id,
-            expiry,
-            strike,
-            option_type,
-            COUNT(*)
-
-        FROM option_features
-
-        GROUP BY
-            market_snapshot_id,
-            expiry,
-            strike,
-            option_type
-
-        HAVING COUNT(*) > 1
-        """
-    )
-
-    option_duplicates = (
-        cursor.fetchall()
-    )
-
-    # --------------------------------------------------------
-    # Option record count per snapshot
-    # --------------------------------------------------------
-
-    cursor.execute(
-        """
-        SELECT
-            market_snapshot_id,
-            COUNT(*)
-
-        FROM option_features
-
-        GROUP BY
-            market_snapshot_id
-
-        HAVING COUNT(*) != ?
-        """,
-        (
-            EXPECTED_OPTIONS_PER_SNAPSHOT,
+    market_feature_timestamps = {
+        row["market_snapshot_id"]: row["timestamp_utc"]
+        for row in cursor.execute(
+            "SELECT market_snapshot_id, timestamp_utc FROM market_features"
         )
-    )
-
-    incomplete_feature_snapshots = (
-        cursor.fetchall()
-    )
-
+    }
+    market_feature_ids = set(market_feature_timestamps)
+    option_duplicate_groups = 0
+    market_duplicate_groups = cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT market_snapshot_id
+            FROM market_features
+            GROUP BY market_snapshot_id
+            HAVING COUNT(*) > 1
+        )
+        """
+    ).fetchone()[0]
+    orphan_option_features = cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM option_features AS feature
+        LEFT JOIN market_features AS market_feature
+          ON market_feature.market_snapshot_id = feature.market_snapshot_id
+        LEFT JOIN market_snapshots AS market
+          ON market.id = feature.market_snapshot_id
+        WHERE market_feature.market_snapshot_id IS NULL
+           OR market.id IS NULL
+        """
+    ).fetchone()[0]
+    total_market_snapshots = cursor.execute(
+        "SELECT COUNT(*) FROM market_snapshots"
+    ).fetchone()[0]
     connection.close()
 
+    seen_market_feature_ids = set()
+    for offset in range(0, total_market_snapshots, DEFAULT_FEATURE_BATCH_SIZE):
+        snapshots = load_snapshot_data(
+            limit=DEFAULT_FEATURE_BATCH_SIZE,
+            offset=offset,
+        )
+        snapshot_ids = [
+            snapshot["market_snapshot_id"]
+            for snapshot in snapshots
+            if snapshot["market_snapshot_id"] in market_feature_ids
+        ]
+        if not snapshot_ids:
+            continue
+
+        seen_market_feature_ids.update(snapshot_ids)
+        placeholders = ",".join("?" for _ in snapshot_ids)
+        feature_connection = get_connection()
+        feature_rows = feature_connection.execute(
+            f"""
+            SELECT market_snapshot_id, timestamp_utc, expiry, strike, option_type
+            FROM option_features
+            WHERE market_snapshot_id IN ({placeholders})
+            """,
+            snapshot_ids,
+        ).fetchall()
+        option_duplicate_groups += feature_connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM (
+                SELECT market_snapshot_id, expiry, strike, option_type
+                FROM option_features
+                WHERE market_snapshot_id IN ({placeholders})
+                GROUP BY market_snapshot_id, expiry, strike, option_type
+                HAVING COUNT(*) > 1
+            )
+            """,
+            snapshot_ids,
+        ).fetchone()[0]
+        feature_connection.close()
+        feature_rows_by_snapshot = {}
+        for row in feature_rows:
+            feature_rows_by_snapshot.setdefault(
+                row["market_snapshot_id"], []
+            ).append(row)
+
+        for snapshot in snapshots:
+            snapshot_id = snapshot["market_snapshot_id"]
+            if snapshot_id not in market_feature_ids:
+                continue
+            rows = feature_rows_by_snapshot.get(snapshot_id, [])
+            if not snapshot["complete"]:
+                invalid_feature_snapshots.add(snapshot_id)
+                orphan_option_features += len(rows)
+                continue
+
+            expected_timestamp = snapshot["timestamp"]
+            if (
+                parse_timestamp(market_feature_timestamps[snapshot_id])
+                != expected_timestamp
+            ):
+                invalid_feature_snapshots.add(snapshot_id)
+
+            raw_contracts = {
+                (
+                    str(row["expiry"]).strip(),
+                    finite_number(row["strike"]),
+                    row["option_type"],
+                )
+                for row in snapshot["option_rows"]
+            }
+            stored_contracts = set()
+            for row in rows:
+                strike = finite_number(row["strike"])
+                contract = (
+                    str(row["expiry"]).strip()
+                    if row["expiry"] is not None else "",
+                    strike,
+                    row["option_type"],
+                )
+                if (
+                    parse_timestamp(row["timestamp_utc"]) != expected_timestamp
+                    or strike is None
+                    or contract not in raw_contracts
+                ):
+                    orphan_option_features += 1
+                    invalid_feature_snapshots.add(snapshot_id)
+                    continue
+                stored_contracts.add(contract)
+
+            missing = raw_contracts - stored_contracts
+            missing_option_features += len(missing)
+            if missing:
+                invalid_feature_snapshots.add(snapshot_id)
+
+        del snapshots
+
+    for snapshot_id in market_feature_ids - seen_market_feature_ids:
+        invalid_feature_snapshots.add(snapshot_id)
+
     return {
+        "market_duplicates": market_duplicate_groups,
 
-        "market_duplicates":
-            len(market_duplicates),
+        "option_duplicates": option_duplicate_groups,
 
-        "option_duplicates":
-            len(option_duplicates),
+        "orphan_option_features":
+            orphan_option_features,
+
+        "missing_option_features":
+            missing_option_features,
 
         "incomplete_feature_snapshots":
-            len(
-                incomplete_feature_snapshots
-            )
+            len(invalid_feature_snapshots),
     }
 
 
@@ -1554,6 +1764,16 @@ if __name__ == "__main__":
     )
 
     print(
+        f"Batch size              : "
+        f"{DEFAULT_FEATURE_BATCH_SIZE}"
+    )
+
+    print(
+        f"Processed snapshots     : "
+        f"{result['processed_snapshots']}"
+    )
+
+    print(
         f"Complete snapshots      : "
         f"{result['complete_snapshots']}"
     )
@@ -1563,10 +1783,32 @@ if __name__ == "__main__":
         f"{result['skipped_incomplete']}"
     )
 
+    validation_reason_counts = result["skipped_validation_reasons"]
+    if isinstance(validation_reason_counts, dict):
+        for validation_reason, skipped_count in sorted(
+            validation_reason_counts.items()
+        ):
+            print(f"  {skipped_count} snapshot(s): {validation_reason}")
+
     print(
         f"Skipped unhealthy       : "
         f"{result['skipped_unhealthy']}"
     )
+
+    print(
+        f"Rejected snapshots      : "
+        f"{result['rejected_snapshots']}"
+    )
+
+    print(
+        f"Failed snapshots        : "
+        f"{result['failed_snapshots']}"
+    )
+
+    for failure_reason, failed_count in sorted(
+        result["failure_reasons"].items()
+    ):
+        print(f"  {failed_count} snapshot(s): {failure_reason}")
 
     print(
         f"Continuous snapshots    : "
@@ -1648,6 +1890,16 @@ if __name__ == "__main__":
     print(
         f"Option duplicates       : "
         f"{integrity['option_duplicates']}"
+    )
+
+    print(
+        f"Orphan option features   : "
+        f"{integrity['orphan_option_features']}"
+    )
+
+    print(
+        f"Missing option features  : "
+        f"{integrity['missing_option_features']}"
     )
 
     print(

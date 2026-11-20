@@ -312,9 +312,9 @@ def main():
     print(f"Feature/outcome timestamp diff : {feature_outcome_mismatch}")
 
     if missing_outcomes == 0 and feature_outcome_mismatch == 0:
-        print_check("Feature → outcome linkage", "PASS")
+        print_check("Feature to outcome linkage", "PASS")
     else:
-        print_check("Feature → outcome linkage", "FAIL")
+        print_check("Feature to outcome linkage", "FAIL")
         failures.append("Feature/outcome linkage problems detected")
 
     # ------------------------------------------------------------

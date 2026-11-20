@@ -238,7 +238,10 @@ def main():
     
     print("\n" + "="*70)
     if all_passed:
-        print("✅ ALL TESTS PASSED - PROJECT IS READY FOR PRODUCTION")
+        print(
+            "ALL SMOKE TESTS PASSED - "
+            "DATASET AND PRODUCTION READINESS NOT ASSESSED"
+        )
         print("="*70)
         return 0
     else:

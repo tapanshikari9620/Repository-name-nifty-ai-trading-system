@@ -1,14 +1,22 @@
 import sqlite3
 import math
+import os
 
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-DATABASE_NAME = "nifty_market_data.db"
+DATABASE_NAME = os.environ.get(
+    "NIFTY_MARKET_DATABASE",
+    str(Path(__file__).resolve().parent / "nifty_market_data.db"),
+)
+PRODUCTION_DATABASE_PATH = (
+    Path(__file__).resolve().parent / "nifty_market_data.db"
+).resolve()
 
 HORIZONS = {
     "5m": 5,
@@ -43,12 +51,54 @@ DIRECTION_THRESHOLD_PERCENT = 0.05
 
 def get_connection():
 
-    connection = sqlite3.connect(
+    database_path = Path(
         DATABASE_NAME
+    ).expanduser().resolve()
+
+    if not database_path.is_file():
+        raise FileNotFoundError(
+            f"Database not found: {database_path}"
+        )
+
+    connection = sqlite3.connect(
+        database_path
     )
 
     connection.row_factory = sqlite3.Row
 
+    return connection
+
+
+def assert_safe_write_target(connection):
+    database_path = Path(DATABASE_NAME).expanduser().resolve()
+
+    if database_path == PRODUCTION_DATABASE_PATH:
+        raise RuntimeError(
+            "Historical outcome writes are disabled for the production "
+            f"database: {database_path}"
+        )
+
+    connected_paths = {
+        Path(row[2]).expanduser().resolve()
+        for row in connection.execute("PRAGMA database_list")
+        if row[1] == "main" and row[2]
+    }
+
+    if connected_paths != {database_path}:
+        raise RuntimeError(
+            "Database connection does not match the configured isolated "
+            f"database path: configured={database_path}, "
+            f"connected={sorted(map(str, connected_paths))}"
+        )
+
+
+def get_write_connection():
+    connection = get_connection()
+    try:
+        assert_safe_write_target(connection)
+    except BaseException:
+        connection.close()
+        raise
     return connection
 
 
@@ -115,7 +165,7 @@ def parse_timestamp(timestamp):
 
 def initialize_outcome_table():
 
-    connection = get_connection()
+    connection = get_write_connection()
 
     cursor = connection.cursor()
 
@@ -336,45 +386,38 @@ def find_future_snapshot(
         )
     )
 
-    for snapshot in snapshots:
+    # load_market_snapshots() guarantees chronological order. Find the same
+    # first observation as the previous scan without rescanning prior rows.
+    lower = 0
+    upper = len(snapshots)
+    while lower < upper:
+        middle = (lower + upper) // 2
+        if snapshots[middle]["timestamp"] < target_timestamp:
+            lower = middle + 1
+        else:
+            upper = middle
 
-        snapshot_timestamp = (
-            snapshot["timestamp"]
-        )
+    if lower == len(snapshots):
+        return None
 
-        # Never use the source snapshot itself.
-        if snapshot_timestamp <= source_timestamp:
-            continue
+    snapshot = snapshots[lower]
+    snapshot_timestamp = snapshot["timestamp"]
 
-        # Snapshot must reach the target.
-        if snapshot_timestamp < target_timestamp:
-            continue
+    # The target is strictly after the source; retain the explicit guard.
+    if snapshot_timestamp <= source_timestamp:
+        return None
 
-        delay_seconds = (
-            snapshot_timestamp
-            - target_timestamp
-        ).total_seconds()
+    delay_seconds = (
+        snapshot_timestamp - target_timestamp
+    ).total_seconds()
+    if delay_seconds > MAX_FUTURE_DELAY_SECONDS:
+        return None
 
-        # Future observation is too late.
-        if (
-            delay_seconds
-            > MAX_FUTURE_DELAY_SECONDS
-        ):
-
-            return None
-
-        return {
-            "snapshot":
-                snapshot,
-
-            "target_timestamp":
-                target_timestamp,
-
-            "delay_seconds":
-                delay_seconds
-        }
-
-    return None
+    return {
+        "snapshot": snapshot,
+        "target_timestamp": target_timestamp,
+        "delay_seconds": delay_seconds,
+    }
 
 
 # ============================================================
@@ -530,7 +573,7 @@ def store_outcome(
     outcomes
 ):
 
-    connection = get_connection()
+    connection = get_write_connection()
 
     cursor = connection.cursor()
 
@@ -549,7 +592,7 @@ def store_outcome(
 
         cursor.execute(
             """
-            INSERT OR REPLACE INTO historical_outcomes (
+            INSERT OR IGNORE INTO historical_outcomes (
 
                 market_snapshot_id,
                 timestamp_utc,

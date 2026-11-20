@@ -1,7 +1,13 @@
 import sqlite3
+import os
+from pathlib import Path
+
 from datetime import datetime, timezone
 
-DATABASE_NAME = "nifty_market_data.db"
+DATABASE_NAME = os.environ.get(
+    "NIFTY_MARKET_DATABASE",
+    str(Path(__file__).resolve().parent / "nifty_market_data.db"),
+)
 MAX_FUTURE_DELAY_SECONDS = 90.0
 HORIZONS = {"5m": 5, "15m": 15, "30m": 30, "60m": 60}
 
@@ -15,7 +21,10 @@ def parse_ts(value):
         return None
 
 def get_connection():
-    conn = sqlite3.connect(f"file:{DATABASE_NAME}?mode=ro", uri=True)
+    conn = sqlite3.connect(
+        Path(DATABASE_NAME).resolve().as_uri() + "?mode=ro",
+        uri=True,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     return conn

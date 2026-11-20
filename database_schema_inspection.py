@@ -1,14 +1,24 @@
 import sqlite3
+import os
+from pathlib import Path
 
 
-DATABASE_NAME = "nifty_market_data.db"
+DATABASE_NAME = os.environ.get(
+    "NIFTY_MARKET_DATABASE",
+    str(Path(__file__).resolve().parent / "nifty_market_data.db"),
+)
 
 
 def inspect_database():
 
+    database_path = Path(DATABASE_NAME).resolve()
+    if not database_path.is_file():
+        raise FileNotFoundError(f"Database not found: {database_path}")
     connection = sqlite3.connect(
-        DATABASE_NAME
+        database_path.as_uri() + "?mode=ro",
+        uri=True,
     )
+    connection.execute("PRAGMA query_only = ON")
 
     cursor = connection.cursor()
 

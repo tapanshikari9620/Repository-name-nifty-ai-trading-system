@@ -61,7 +61,8 @@ def test_load_snapshots_error_handling():
         if snapshots:
             # Check structure
             first_snapshot = snapshots[0]
-            if 'id' in first_snapshot and 'timestamp_utc' in first_snapshot and 'spot_price' in first_snapshot:
+            required_fields = {'id', 'timestamp_utc', 'spot_price'}
+            if required_fields.issubset(first_snapshot.keys()):
                 logger.info(f"✓ Snapshot structure valid: id={first_snapshot['id']}")
             else:
                 logger.error(f"✗ Missing required fields: {dict(first_snapshot)}")
@@ -98,17 +99,31 @@ def test_price_movement_error_handling():
         logger.info("Test 3a: Analyzing movements with invalid prices...")
         result = msi.analyze_price_movements(session_snapshots)
         
-        # Should have skipped the invalid entries
+        # Invalid adjacent pairs are skipped; don't bridge over bad snapshots.
         movements_count = len(result['movements'])
-        expected_movements = 2  # Only valid pairs: (1,3) and (3,5)
-        
-        if movements_count >= 2:
-            logger.info(f"✓ Skipped invalid prices. Movements: {movements_count}")
-            logger.info(f"  Movement pairs processed: {movements_count}")
-            return True
-        else:
-            logger.error(f"✗ Expected at least 2 movements, got {movements_count}")
+
+        if movements_count != 0:
+            logger.error(
+                f"✗ Invalid adjacent prices should not produce movements; "
+                f"got {movements_count}"
+            )
             return False
+
+        valid_snapshots = [
+            {'id': 1, 'spot_price': 100.5},
+            {'id': 2, 'spot_price': 102.5},
+            {'id': 3, 'spot_price': 105.0},
+        ]
+        valid_result = msi.analyze_price_movements(valid_snapshots)
+        if len(valid_result['movements']) != 2:
+            logger.error(
+                "✗ Expected 2 movements from valid adjacent prices, "
+                f"got {len(valid_result['movements'])}"
+            )
+            return False
+
+        logger.info("✓ Invalid pairs skipped; valid adjacent pairs processed")
+        return True
         
     except Exception as e:
         logger.error(f"✗ Crashed on invalid price (fix not working): {type(e).__name__}: {e}")

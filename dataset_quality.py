@@ -1,12 +1,19 @@
 import sqlite3
 import math
+import os
 
+from datetime import datetime, time, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-DATABASE_NAME = "nifty_market_data.db"
+DATABASE_NAME = os.environ.get(
+    "NIFTY_MARKET_DATABASE",
+    str(Path(__file__).resolve().parent / "nifty_market_data.db"),
+)
 
 # Minimum research thresholds.
 #
@@ -30,6 +37,12 @@ MIN_BEARISH_SAMPLES = 50
 
 MIN_FLAT_SAMPLES = 50
 
+MIN_TRADING_SESSIONS = 120
+
+MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
+MARKET_OPEN = time(9, 15)
+MARKET_CLOSE = time(15, 30)
+
 
 # ============================================================
 # DATABASE CONNECTION
@@ -38,10 +51,12 @@ MIN_FLAT_SAMPLES = 50
 def get_connection():
 
     connection = sqlite3.connect(
-        DATABASE_NAME
+        f"{Path(DATABASE_NAME).resolve().as_uri()}?mode=ro",
+        uri=True
     )
 
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
 
     return connection
 
@@ -161,23 +176,42 @@ def get_trading_sessions():
 
     cursor.execute(
         """
-        SELECT COUNT(
-            DISTINCT substr(
-                timestamp_utc,
-                1,
-                10
-            )
-        )
-
+        SELECT DISTINCT timestamp_utc
         FROM market_features
         """
     )
 
-    count = cursor.fetchone()[0]
+    timestamps = cursor.fetchall()
 
     connection.close()
 
-    return count
+    sessions = set()
+
+    for row in timestamps:
+
+        try:
+            timestamp = datetime.fromisoformat(
+                row["timestamp_utc"]
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(
+                tzinfo=timezone.utc
+            )
+
+        timestamp_ist = timestamp.astimezone(
+            MARKET_TIMEZONE
+        )
+        session_time = timestamp_ist.time().replace(
+            tzinfo=None
+        )
+
+        if MARKET_OPEN <= session_time <= MARKET_CLOSE:
+            sessions.add(timestamp_ist.date())
+
+    return len(sessions)
 
 
 # ============================================================
@@ -589,10 +623,11 @@ def calculate_readiness(
     # TRADING SESSIONS
     # ========================================================
 
-    if trading_sessions < 5:
+    if trading_sessions < MIN_TRADING_SESSIONS:
 
-        warnings.append(
-            "Less than 5 trading sessions."
+        problems.append(
+            f"Insufficient trading sessions "
+            f"({trading_sessions}/{MIN_TRADING_SESSIONS})."
         )
 
     # ========================================================
@@ -1185,28 +1220,29 @@ if __name__ == "__main__":
     ]:
 
         print(
-            "ML DATASET READINESS : READY"
+            "RESEARCH DATA GATE : PASSED"
         )
 
         print()
 
         print(
-            "The minimum configured "
-            "research-data thresholds "
-            "have been reached."
+            "Configured research-data "
+            "thresholds are met. This does "
+            "not establish ML-training or "
+            "production readiness."
         )
 
     else:
 
         print(
-            "ML DATASET READINESS : NOT READY"
+            "RESEARCH DATA GATE : NOT MET"
         )
 
         print()
 
         print(
-            "Continue collecting "
-            "historical market data."
+            "Continue collection and "
+            "data-quality validation."
         )
 
     print("=" * 70)

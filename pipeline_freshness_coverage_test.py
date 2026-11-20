@@ -1,8 +1,12 @@
 import sqlite3
+import os
 from collections import Counter
 from pathlib import Path
 
-DB_NAME='nifty_market_data.db'
+DB_NAME = os.environ.get(
+    'NIFTY_MARKET_DATABASE',
+    str(Path(__file__).resolve().parent / 'nifty_market_data.db'),
+)
 
 def cols(conn, table):
     return {r['name'] for r in conn.execute(f'PRAGMA table_info({table})')}
@@ -61,7 +65,12 @@ def main():
         print('\nORPHAN / INTEGRITY\n'+'-'*82)
         print(f'Features pointing to missing raw   : {len(feature_without_raw)}')
         print('\nSTATUS\n'+'-'*82)
-        if feature_without_raw or feature_without_outcome or outcome_without_feature or exact210:
+        if (
+            missing_eligible
+            or feature_without_raw
+            or feature_without_outcome
+            or outcome_without_feature
+        ):
             print('PIPELINE COVERAGE STATUS : REVIEW REQUIRED')
         else:
             print('PIPELINE COVERAGE STATUS : PASS')

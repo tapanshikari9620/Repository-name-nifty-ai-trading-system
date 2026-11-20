@@ -2,6 +2,7 @@ import time
 import sqlite3
 import msvcrt
 import os
+import math
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -9,10 +10,12 @@ from zoneinfo import ZoneInfo
 from upstox_api import get_option_chain
 
 from market_snapshot import (
+    initialize_snapshot_table,
     store_snapshot
 )
 
 from option_snapshot import (
+    initialize_option_snapshot_table,
     store_option_snapshot
 )
 
@@ -21,6 +24,7 @@ from option_snapshot_validation import (
 )
 
 from collection_health import (
+    initialize_collection_health_table,
     log_collection_health
 )
 
@@ -139,6 +143,10 @@ def configure_database():
 
         connection.close()
 
+    initialize_snapshot_table()
+    initialize_option_snapshot_table()
+    initialize_collection_health_table()
+
 
 # ============================================================
 # CURRENT IST TIME
@@ -242,26 +250,32 @@ def validate_option_chain_response(
 
             continue
 
-        if strike <= 0:
+        if not math.isfinite(strike) or strike <= 0:
 
             errors.append(
                 f"Invalid strike: {strike}"
             )
+            continue
 
         strikes.append(
             strike
         )
 
-        if option.get(
-            "call_options"
-        ):
+        call_side = option.get("call_options")
+        put_side = option.get("put_options")
 
+        if not isinstance(call_side, dict) or not call_side:
+            errors.append(
+                f"Missing or invalid CE side at strike {strike}."
+            )
+        else:
             ce_count += 1
 
-        if option.get(
-            "put_options"
-        ):
-
+        if not isinstance(put_side, dict) or not put_side:
+            errors.append(
+                f"Missing or invalid PE side at strike {strike}."
+            )
+        else:
             pe_count += 1
 
     # Duplicate strike check
@@ -299,7 +313,7 @@ def validate_option_chain_response(
 
 def extract_spot_price(
     option_chain
-):
+) -> float:
 
     spot_price = None
 
@@ -354,6 +368,12 @@ def extract_spot_price(
                 if value is None:
                     continue
 
+                if not isinstance(
+                    value,
+                    (int, float, str)
+                ):
+                    continue
+
                 try:
 
                     spot_price = float(
@@ -379,7 +399,7 @@ def extract_spot_price(
             "be extracted from option chain."
         )
 
-    if spot_price <= 0:
+    if not math.isfinite(spot_price) or spot_price <= 0:
 
         raise RuntimeError(
             f"Invalid NIFTY spot price: "
@@ -859,6 +879,7 @@ def collect_one_snapshot():
                 rollback_snapshot(
                     market_snapshot_id
                 )
+                market_snapshot_id = None
 
                 print()
                 print(
@@ -1009,160 +1030,81 @@ def wait_until_market_open():
 
 def run_collector():
 
+    collector_lock = None
+
     try:
+        # All imported database helpers use relative SQLite paths.
+        # Pin the working directory to this script so manual runs and
+        # Task Scheduler runs always target the same database.
+        script_directory = os.path.dirname(os.path.abspath(__file__))
+        os.chdir(script_directory)
 
-        collector_lock = (
-            acquire_collector_lock()
-        )
-
+        collector_lock = acquire_collector_lock()
         configure_database()
 
-    except RuntimeError as error:
-
+    except Exception as error:
+        if collector_lock is not None:
+            collector_lock.close()
         print()
-        print(
-            f"[COLLECTOR NOT STARTED] {error}"
-        )
-
+        print(f"[COLLECTOR NOT STARTED] {type(error).__name__}: {error}")
         return
 
     print()
     print("=" * 70)
-
-    print(
-        "NIFTY OPTION SNAPSHOT COLLECTOR"
-    )
-
+    print("NIFTY OPTION SNAPSHOT COLLECTOR")
     print("=" * 70)
-
     print()
-
-    print(
-        f"Collection interval : "
-        f"{COLLECTION_INTERVAL_SECONDS} seconds"
-    )
-
-    print(
-        f"Database             : "
-        f"{DATABASE_NAME}"
-    )
-
-    print()
-
-    print(
-        "Collection Health    : ENABLED"
-    )
-
-    print()
-
-    print(
-        "Collector started."
-    )
-
-    print(
-        "Press Ctrl+C to stop."
-    )
-
+    print(f"Collection interval : {COLLECTION_INTERVAL_SECONDS} seconds")
+    print(f"Database             : {os.path.abspath(DATABASE_NAME)}")
+    print("Collection Health    : ENABLED")
+    print("Collector started.")
+    print("Press Ctrl+C to stop.")
     print()
 
     next_run = time.monotonic()
 
-    while True:
+    try:
+        while True:
+            try:
+                if not is_market_open():
+                    wait_until_market_open()
+                    next_run = time.monotonic()
 
-        try:
+                collect_one_snapshot()
 
-            # =================================================
-            # MARKET SESSION
-            # =================================================
+                next_run += COLLECTION_INTERVAL_SECONDS
+                sleep_seconds = next_run - time.monotonic()
 
-            if not is_market_open():
+                if sleep_seconds < 0:
+                    # Do not run a burst of back-to-back calls after a slow API.
+                    next_run = time.monotonic()
+                    sleep_seconds = 0
 
-                wait_until_market_open()
+                print()
+                print(f"Next collection in {sleep_seconds:.1f} seconds.")
 
-                next_run = (
-                    time.monotonic()
-                )
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
 
-            # =================================================
-            # COLLECTION
-            # =================================================
+            except KeyboardInterrupt:
+                print()
+                print("=" * 70)
+                print("OPTION SNAPSHOT COLLECTOR STOPPED")
+                print("=" * 70)
+                break
 
-            collect_one_snapshot()
-
-            # =================================================
-            # NEXT SCHEDULED RUN
-            # =================================================
-
-            next_run += (
-                COLLECTION_INTERVAL_SECONDS
-            )
-
-            sleep_seconds = (
-                next_run
-                - time.monotonic()
-            )
-
-            if sleep_seconds < 0:
-
-                next_run = (
-                    time.monotonic()
-                )
-
-                sleep_seconds = 0
-
-            print()
-
-            print(
-                f"Next collection in "
-                f"{sleep_seconds:.1f} seconds."
-            )
-
-            if sleep_seconds > 0:
-
-                time.sleep(
-                    sleep_seconds
-                )
-
-        except KeyboardInterrupt:
-
-            print()
-            print()
-
-            print(
-                "=" * 70
-            )
-
-            print(
-                "OPTION SNAPSHOT COLLECTOR STOPPED"
-            )
-
-            print(
-                "=" * 70
-            )
-
-            break
-
-        except Exception as error:
-
-            print()
-            print(
-                "[CRITICAL LOOP ERROR]"
-            )
-
-            print(
-                error
-            )
-
-            print(
-                "Collector will retry in "
-                "10 seconds."
-            )
-
-            time.sleep(
-                10
-            )
-
-    collector_lock.close()
+            except Exception as error:
+                print()
+                print(f"[CRITICAL LOOP ERROR] {type(error).__name__}: {error}")
+                print("Collector will retry in 10 seconds.")
+                try:
+                    time.sleep(10)
+                except KeyboardInterrupt:
+                    print("Collector stopped by user.")
+                    break
+    finally:
+        if collector_lock is not None:
+            collector_lock.close()
 
 
 # ============================================================

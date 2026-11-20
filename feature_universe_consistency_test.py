@@ -1,267 +1,209 @@
+import os
 import sqlite3
-from collections import Counter
+from contextlib import closing
+from pathlib import Path
 
-DB_PATH = "nifty_market_data.db"
-
-EXPECTED_TOTAL = 210
-EXPECTED_CE = 105
-EXPECTED_PE = 105
+import historical_feature_builder as feature_builder
 
 
-def main():
+DATABASE_NAME = os.environ.get(
+    "NIFTY_MARKET_DATABASE",
+    str(Path(__file__).resolve().parent / "nifty_market_data.db"),
+)
+def get_connection(database_name=None):
+    database_path = Path(database_name or DATABASE_NAME).resolve()
+    if not database_path.is_file():
+        raise FileNotFoundError(f"Database not found: {database_path}")
+    connection = sqlite3.connect(
+        database_path.as_uri() + "?mode=ro",
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
+    return connection
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
 
-    print("=" * 70)
-    print("210-CONTRACT FEATURE UNIVERSE CONSISTENCY TEST")
-    print("=" * 70)
+def contract_key(row):
+    expiry = str(row["expiry"]).strip() if row["expiry"] is not None else ""
+    strike = feature_builder.finite_number(row["strike"])
+    return expiry, strike, row["option_type"]
 
-    # ---------------------------------------------------------
-    # 1. Feature snapshot count
-    # ---------------------------------------------------------
-    feature_snapshots = conn.execute("""
-        SELECT COUNT(DISTINCT snapshot_id)
-        FROM option_features
-    """).fetchone()[0]
 
-    option_feature_rows = conn.execute("""
+def audit_feature_snapshots(connection):
+    feature_snapshot_ids = [
+        row[0]
+        for row in connection.execute(
+            "SELECT DISTINCT market_snapshot_id FROM option_features "
+            "ORDER BY market_snapshot_id"
+        )
+    ]
+    market_feature_ids = {
+        row[0]
+        for row in connection.execute(
+            "SELECT market_snapshot_id FROM market_features"
+        )
+    }
+    results = []
+
+    for snapshot_id in feature_snapshot_ids:
+        market = connection.execute(
+            """
+            SELECT id, timestamp_utc, spot_price
+            FROM market_snapshots
+            WHERE id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        raw_rows = connection.execute(
+            "SELECT * FROM option_snapshots WHERE market_snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+        feature_rows = connection.execute(
+            "SELECT * FROM option_features WHERE market_snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+        market_feature = connection.execute(
+            """
+            SELECT timestamp_utc, spot_price
+            FROM market_features
+            WHERE market_snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        errors = []
+
+        if market is None:
+            errors.append("Market snapshot is missing.")
+        else:
+            errors.extend(
+                feature_builder.validate_snapshot_records(market, raw_rows)
+            )
+        if market_feature is None:
+            errors.append("Market feature row is missing.")
+        elif market is not None:
+            if (
+                feature_builder.parse_timestamp(market_feature["timestamp_utc"])
+                != feature_builder.parse_timestamp(market["timestamp_utc"])
+            ):
+                errors.append("Market feature timestamp does not match raw snapshot.")
+            if market_feature["spot_price"] != market["spot_price"]:
+                errors.append("Market feature spot price differs from raw snapshot.")
+
+        raw_keys = [contract_key(row) for row in raw_rows]
+        feature_keys = [contract_key(row) for row in feature_rows]
+        raw_contracts = set(raw_keys)
+        feature_contracts = set(feature_keys)
+
+        if len(raw_keys) != len(raw_contracts):
+            errors.append("Raw snapshot contains duplicate contracts.")
+        if len(feature_keys) != len(feature_contracts):
+            errors.append("Feature snapshot contains duplicate contracts.")
+
+        missing = raw_contracts - feature_contracts
+        unexpected = feature_contracts - raw_contracts
+        if missing:
+            errors.append(f"{len(missing)} raw contracts have no feature row.")
+        if unexpected:
+            errors.append(f"{len(unexpected)} feature rows have no raw contract.")
+
+        raw_by_contract = {
+            contract_key(row): row
+            for row in raw_rows
+        }
+        for feature in feature_rows:
+            key = contract_key(feature)
+            raw = raw_by_contract.get(key)
+            if raw is None:
+                continue
+            if market is None or (
+                feature_builder.parse_timestamp(feature["timestamp_utc"])
+                != feature_builder.parse_timestamp(market["timestamp_utc"])
+            ):
+                errors.append("Feature timestamp does not match market snapshot.")
+                break
+
+        feature_ce = {
+            key[1] for key in feature_contracts if key[2] == "CE"
+        }
+        feature_pe = {
+            key[1] for key in feature_contracts if key[2] == "PE"
+        }
+        results.append({
+            "market_snapshot_id": snapshot_id,
+            "raw_count": len(raw_rows),
+            "feature_count": len(feature_rows),
+            "feature_ce_count": sum(
+                row["option_type"] == "CE" for row in feature_rows
+            ),
+            "feature_pe_count": sum(
+                row["option_type"] == "PE" for row in feature_rows
+            ),
+            "paired": bool(feature_ce) and feature_ce == feature_pe,
+            "errors": sorted(set(errors)),
+        })
+
+    orphan_raw = connection.execute(
+        """
         SELECT COUNT(*)
-        FROM option_features
-    """).fetchone()[0]
+        FROM option_snapshots o
+        LEFT JOIN market_snapshots m ON m.id = o.market_snapshot_id
+        WHERE m.id IS NULL
+        """
+    ).fetchone()[0]
+    missing_option_features = market_feature_ids - set(feature_snapshot_ids)
+    return results, orphan_raw, missing_option_features
 
-    expected_rows = feature_snapshots * EXPECTED_TOTAL
 
-    print(f"\nFeature snapshots        : {feature_snapshots}")
-    print(f"Option feature rows      : {option_feature_rows}")
-    print(f"Expected rows            : {expected_rows}")
-
-    # ---------------------------------------------------------
-    # 2. Check every snapshot has exactly 210 records
-    # ---------------------------------------------------------
-    counts = conn.execute("""
-        SELECT snapshot_id, COUNT(*) AS cnt
-        FROM option_features
-        GROUP BY snapshot_id
-    """).fetchall()
-
-    wrong_count_snapshots = [
-        (row["snapshot_id"], row["cnt"])
-        for row in counts
-        if row["cnt"] != EXPECTED_TOTAL
-    ]
-
-    print(f"\nSnapshots with exactly 210 : "
-          f"{len(counts) - len(wrong_count_snapshots)}")
-
-    print(f"Snapshots with wrong count  : "
-          f"{len(wrong_count_snapshots)}")
-
-    if wrong_count_snapshots:
-        print("\nWRONG COUNT DETAILS:")
-        for snapshot_id, count in wrong_count_snapshots[:20]:
-            print(f"  Snapshot {snapshot_id}: {count} records")
-
-    # ---------------------------------------------------------
-    # 3. CE / PE distribution
-    # ---------------------------------------------------------
-    type_counts = conn.execute("""
-        SELECT option_type, COUNT(*) AS cnt
-        FROM option_features
-        GROUP BY option_type
-    """).fetchall()
-
-    print("\nOPTION TYPE DISTRIBUTION")
-
-    for row in type_counts:
-        print(f"{row['option_type']} : {row['cnt']}")
-
-    # ---------------------------------------------------------
-    # 4. Check CE/PE count per snapshot
-    # ---------------------------------------------------------
-    wrong_ce_pe = []
-
-    for row in counts:
-        snapshot_id = row["snapshot_id"]
-
-        ce = conn.execute("""
-            SELECT COUNT(*)
-            FROM option_features
-            WHERE snapshot_id = ?
-              AND option_type = 'CE'
-        """, (snapshot_id,)).fetchone()[0]
-
-        pe = conn.execute("""
-            SELECT COUNT(*)
-            FROM option_features
-            WHERE snapshot_id = ?
-              AND option_type = 'PE'
-        """, (snapshot_id,)).fetchone()[0]
-
-        if ce != EXPECTED_CE or pe != EXPECTED_PE:
-            wrong_ce_pe.append((snapshot_id, ce, pe))
-
-    print(f"\nSnapshots with 105 CE + 105 PE : "
-          f"{len(counts) - len(wrong_ce_pe)}")
-
-    print(f"Snapshots with wrong CE/PE       : "
-          f"{len(wrong_ce_pe)}")
-
-    if wrong_ce_pe:
-        print("\nWRONG CE/PE DETAILS:")
-        for snapshot_id, ce, pe in wrong_ce_pe[:20]:
-            print(
-                f"  Snapshot {snapshot_id}: "
-                f"CE={ce}, PE={pe}"
-            )
-
-    # ---------------------------------------------------------
-    # 5. Duplicate contract check
-    # ---------------------------------------------------------
-    duplicate_rows = conn.execute("""
-        SELECT snapshot_id, instrument_key, COUNT(*) AS cnt
-        FROM option_features
-        GROUP BY snapshot_id, instrument_key
-        HAVING COUNT(*) > 1
-    """).fetchall()
-
-    print(f"\nDuplicate feature contracts : {len(duplicate_rows)}")
-
-    if duplicate_rows:
-        print("\nDUPLICATES:")
-        for row in duplicate_rows[:20]:
-            print(
-                f"  Snapshot {row['snapshot_id']} | "
-                f"{row['instrument_key']} | "
-                f"count={row['cnt']}"
-            )
-
-    # ---------------------------------------------------------
-    # 6. Check contract universe consistency
-    # ---------------------------------------------------------
-    snapshots = [
-        row["snapshot_id"]
-        for row in counts
-        if row["cnt"] == EXPECTED_TOTAL
-    ]
-
-    reference_snapshot = snapshots[0] if snapshots else None
-
-    missing_contracts = 0
-    extra_contracts = 0
-    inconsistent_snapshots = 0
-
-    if reference_snapshot is not None:
-
-        reference_contracts = {
-            row["instrument_key"]
-            for row in conn.execute("""
-                SELECT instrument_key
-                FROM option_features
-                WHERE snapshot_id = ?
-            """, (reference_snapshot,))
-        }
-
-        print(
-            f"\nReference snapshot       : {reference_snapshot}"
+def main(database_name=None):
+    with closing(get_connection(database_name)) as connection:
+        results, orphan_raw, missing_option_features = (
+            audit_feature_snapshots(connection)
         )
 
-        print(
-            f"Reference contracts      : "
-            f"{len(reference_contracts)}"
+    failed = [
+        item for item in results
+        if item["errors"] or not item["paired"]
+    ]
+    count_distribution = {}
+    for result in results:
+        count_distribution[result["feature_count"]] = (
+            count_distribution.get(result["feature_count"], 0) + 1
         )
 
-        for snapshot_id in snapshots[1:]:
+    print("=" * 72)
+    print("VARIABLE-SIZED FEATURE UNIVERSE CONSISTENCY TEST")
+    print("READ-ONLY — raw contract count may vary by snapshot")
+    print("=" * 72)
+    print(f"Feature snapshots checked : {len(results)}")
+    print(f"Invalid snapshots          : {len(failed)}")
+    print(f"Orphan raw option rows     : {orphan_raw}")
+    print("Feature row counts:")
+    for record_count, count in sorted(count_distribution.items()):
+        print(f"  {record_count:>4} contracts : {count} snapshots")
 
-            current_contracts = {
-                row["instrument_key"]
-                for row in conn.execute("""
-                    SELECT instrument_key
-                    FROM option_features
-                    WHERE snapshot_id = ?
-                """, (snapshot_id,))
-            }
+    for result in failed[:50]:
+        print(
+            f"FAIL snapshot={result['market_snapshot_id']} "
+            f"raw={result['raw_count']} features={result['feature_count']}"
+        )
+        for error in result["errors"]:
+            print(f"  - {error}")
+        if not result["paired"]:
+            print("  - CE and PE strikes are not paired.")
 
-            missing = reference_contracts - current_contracts
-            extra = current_contracts - reference_contracts
-
-            if missing or extra:
-                inconsistent_snapshots += 1
-                missing_contracts += len(missing)
-                extra_contracts += len(extra)
-
-    print(f"\nSnapshots with inconsistent universe : "
-          f"{inconsistent_snapshots}")
-
-    print(f"Missing contracts                     : "
-          f"{missing_contracts}")
-
-    print(f"Extra contracts                       : "
-          f"{extra_contracts}")
-
-    # ---------------------------------------------------------
-    # 7. Expiry consistency
-    # ---------------------------------------------------------
-    expiry_issues = []
-
-    for snapshot_id in snapshots:
-
-        expiries = {
-            row["expiry"]
-            for row in conn.execute("""
-                SELECT DISTINCT expiry
-                FROM option_features
-                WHERE snapshot_id = ?
-            """, (snapshot_id,))
-        }
-
-        if len(expiries) != 1:
-            expiry_issues.append((snapshot_id, expiries))
-
-    print(f"\nSnapshots with expiry inconsistency : "
-          f"{len(expiry_issues)}")
-
-    # ---------------------------------------------------------
-    # FINAL RESULT
-    # ---------------------------------------------------------
-    failures = []
-
-    if option_feature_rows != expected_rows:
-        failures.append("Total feature row count mismatch")
-
-    if wrong_count_snapshots:
-        failures.append("Some snapshots do not contain exactly 210 records")
-
-    if wrong_ce_pe:
-        failures.append("Some snapshots do not contain 105 CE + 105 PE")
-
-    if duplicate_rows:
-        failures.append("Duplicate feature contracts found")
-
-    if inconsistent_snapshots:
-        failures.append("Contract universe changed between snapshots")
-
-    if expiry_issues:
-        failures.append("Expiry inconsistency found")
-
-    print("\n" + "=" * 70)
-
-    if failures:
-        print("FEATURE UNIVERSE CONSISTENCY STATUS : FAIL")
-
-        print("\nFAILURES:")
-        for failure in failures:
-            print(f"  - {failure}")
-
-    else:
-        print("FEATURE UNIVERSE CONSISTENCY STATUS : PASS")
-        print("\nAll feature snapshots consistently represent")
-        print("the same 210-contract option universe.")
-
-    print("=" * 70)
-
-    conn.close()
+    if missing_option_features:
+        print(
+            "Market feature snapshots without option features: "
+            f"{len(missing_option_features)}"
+        )
+    passed = not failed and orphan_raw == 0 and not missing_option_features
+    print("=" * 72)
+    print(
+        "FEATURE UNIVERSE CONSISTENCY STATUS : "
+        + ("PASS" if passed else "FAIL")
+    )
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
